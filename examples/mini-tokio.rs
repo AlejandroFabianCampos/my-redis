@@ -1,8 +1,10 @@
-use futures::task;
-use std::collections::VecDeque;
+use futures::task::{self, ArcWake};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread;
 use std::time::{Duration, Instant};
 
 struct Delay {
@@ -17,16 +19,29 @@ impl Future for Delay {
             println!("Hello world");
             Poll::Ready("done")
         } else {
-            println!("Delay future not ready yet, returning Poll::Pending");
-            // Ignore this line for now.
-            cx.waker().wake_by_ref();
+            println!("Delay not ready yet, spawning thread to wake when ready");
+            // Get a handle to the waker for the current task
+            let waker = cx.waker().clone();
+            let when = self.when;
+
+            // Spawn a timer thread.
+            thread::spawn(move || {
+                let now = Instant::now();
+
+                if now < when {
+                    thread::sleep(when - now);
+                }
+
+                waker.wake();
+            });
+
             Poll::Pending
         }
     }
 }
 
 fn main() {
-    let mut mini_tokio = MiniTokio::new();
+    let mini_tokio = MiniTokio::new();
 
     mini_tokio.spawn(async {
         let when = Instant::now() + Duration::from_millis(10);
@@ -39,35 +54,115 @@ fn main() {
     mini_tokio.run();
 }
 
-struct MiniTokio {
-    tasks: VecDeque<Task>,
+impl ArcWake for Task {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.schedule();
+    }
 }
 
-type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+/// A structure holding a future and the result of
+/// the latest call to its `poll` method.
+struct TaskFuture {
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    poll: Poll<()>,
+}
+
+struct Task {
+    // The `Mutex` is to make `Task` implement `Sync`. Only
+    // one thread accesses `task_future` at any given time.
+    // The `Mutex` is not required for correctness. Real Tokio
+    // does not use a mutex here, but real Tokio has
+    // more lines of code than can fit in a single tutorial
+    // page.
+    task_future: Mutex<TaskFuture>,
+    executor: mpsc::Sender<Arc<Task>>,
+}
+
+impl Task {
+    fn schedule(self: &Arc<Self>) {
+        self.executor.send(self.clone()).unwrap();
+    }
+}
+
+struct MiniTokio {
+    scheduled: mpsc::Receiver<Arc<Task>>,
+    sender: mpsc::Sender<Arc<Task>>,
+}
 
 impl MiniTokio {
-    fn new() -> MiniTokio {
-        MiniTokio {
-            tasks: VecDeque::new(),
+    fn run(&self) {
+        while let Ok(task) = self.scheduled.recv() {
+            task.poll();
         }
+    }
+
+    /// Initialize a new mini-tokio instance.
+    fn new() -> MiniTokio {
+        let (sender, scheduled) = mpsc::channel();
+
+        MiniTokio { scheduled, sender }
     }
 
     /// Spawn a future onto the mini-tokio instance.
-    fn spawn<F>(&mut self, future: F)
+    ///
+    /// The given future is wrapped with the `Task` harness and pushed into the
+    /// `scheduled` queue. The future will be executed when `run` is called.
+    fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.tasks.push_back(Box::pin(future));
+        Task::spawn(future, &self.sender);
+    }
+}
+
+impl TaskFuture {
+    fn new(future: impl Future<Output = ()> + Send + 'static) -> TaskFuture {
+        TaskFuture {
+            future: Box::pin(future),
+            poll: Poll::Pending,
+        }
     }
 
-    fn run(&mut self) {
-        let waker = task::noop_waker();
+    fn poll(&mut self, cx: &mut Context<'_>) {
+        // Spurious wake-ups are allowed, even after a future has
+        // returned `Ready`. However, polling a future which has
+        // already returned `Ready` is *not* allowed. For this
+        // reason we need to check that the future is still pending
+        // before we call it. Failure to do so can lead to a panic.
+        if self.poll.is_pending() {
+            self.poll = self.future.as_mut().poll(cx);
+        }
+    }
+}
+
+impl Task {
+    fn poll(self: Arc<Self>) {
+        // Create a waker from the `Task` instance. This
+        // uses the `ArcWake` impl from above.
+        let waker = task::waker(self.clone());
         let mut cx = Context::from_waker(&waker);
 
-        while let Some(mut task) = self.tasks.pop_front() {
-            if task.as_mut().poll(&mut cx).is_pending() {
-                self.tasks.push_back(task);
-            }
-        }
+        // No other thread ever tries to lock the task_future
+        let mut task_future = self.task_future.try_lock().unwrap();
+
+        // Poll the inner future
+        task_future.poll(&mut cx);
+    }
+
+    // Spawns a new task with the given future.
+    //
+    // Initializes a new Task harness containing the given future and pushes it
+    // onto `sender`. The receiver half of the channel will get the task and
+    // execute it.
+    fn spawn<F>(future: F, sender: &mpsc::Sender<Arc<Task>>)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let task = Arc::new(Task {
+            task_future: Mutex::new(TaskFuture::new(future)),
+            executor: sender.clone(),
+        });
+
+        let _ = sender.send(task);
     }
 }
